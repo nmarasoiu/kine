@@ -21,15 +21,15 @@ const minCompactBatchSize = 100
 type SQLLog struct {
 	sync.RWMutex
 
-	d                     server.Dialect
-	broadcaster           broadcaster.Broadcaster
-	ctx                   context.Context
-	notify                chan int64
-	currentRev            atomic.Int64
+	d           server.Dialect
+	broadcaster broadcaster.Broadcaster
+	ctx         context.Context
+	notify      chan int64
+	currentRev  atomic.Int64
 	// polledRev is the highest revision the poll loop has passed. Every
 	// revision at or below it is either committed or permanently filled, so it
 	// is the highest revision that can be reported to clients as complete.
-	polledRev atomic.Int64
+	polledRev             atomic.Int64
 	compactInterval       time.Duration
 	compactIntervalJitter int
 	compactTimeout        time.Duration
