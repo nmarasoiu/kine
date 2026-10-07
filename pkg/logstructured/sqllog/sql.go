@@ -26,6 +26,10 @@ type SQLLog struct {
 	ctx                   context.Context
 	notify                chan int64
 	currentRev            atomic.Int64
+	// polledRev is the highest revision the poll loop has passed. Every
+	// revision at or below it is either committed or permanently filled, so it
+	// is the highest revision that can be reported to clients as complete.
+	polledRev atomic.Int64
 	compactInterval       time.Duration
 	compactIntervalJitter int
 	compactTimeout        time.Duration
@@ -295,6 +299,9 @@ func (s *SQLLog) postCompact() error {
 }
 
 func (s *SQLLog) CurrentRevision(ctx context.Context) (int64, error) {
+	if s.polledRev.Load() != 0 {
+		return s.settledRevision(ctx)
+	}
 	currRev := s.currentRev.Load()
 	if currRev != 0 {
 		return currRev, nil
@@ -307,6 +314,30 @@ func (s *SQLLog) CurrentRevision(ctx context.Context) (int64, error) {
 		return lastRev, nil
 	}
 	return s.currentRev.Load(), nil
+}
+
+// settledRevision returns the highest committed revision, after waiting for the
+// poll loop to pass it. Rows are committed out of id order, so MAX(id) alone may
+// sit above a revision whose row is not yet visible; reporting it as current
+// would hand clients a snapshot that is missing that write, and a watch started
+// from it would never deliver it.
+func (s *SQLLog) settledRevision(ctx context.Context) (int64, error) {
+	target, err := s.d.CurrentRevision(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for s.polledRev.Load() < target {
+		select {
+		case s.notify <- target:
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+	return target, nil
 }
 
 func (s *SQLLog) CompactRevision(ctx context.Context) (int64, error) {
@@ -328,6 +359,18 @@ func (s *SQLLog) After(ctx context.Context, key, end string, revision, limit int
 	}
 
 	batch, compact, err = RowsToEvents(rows, true, true)
+	if s.polledRev.Load() != 0 && batch.CurrentRev > currentRev {
+		// Only return events up to the settled revision; later ones are delivered
+		// in order by the poll loop. Returning them here would advance the
+		// caller's revision past rows that have not been committed yet.
+		for i, event := range batch.Events {
+			if event.KV.ModRevision > currentRev {
+				batch.Events = batch.Events[:i]
+				break
+			}
+		}
+		batch.CurrentRev = currentRev
+	}
 
 	if batch.CurrentRev == 0 {
 		// without rows we won't have the compact or current revisions
@@ -367,7 +410,10 @@ func (s *SQLLog) List(ctx context.Context, key, end string, limit, revision int6
 
 	key = s.d.TranslateStartKey(key)
 
-	if revision == 0 {
+	settled := revision == 0 && key != "" && s.polledRev.Load() != 0
+	if settled {
+		rows, err = s.d.List(ctx, key, end, limit, currentRev, includeDeleted, keysOnly)
+	} else if revision == 0 {
 		rows, err = s.d.ListCurrent(ctx, key, end, limit, includeDeleted, keysOnly)
 	} else {
 		rows, err = s.d.List(ctx, key, end, limit, revision, includeDeleted, keysOnly)
@@ -379,6 +425,9 @@ func (s *SQLLog) List(ctx context.Context, key, end string, limit, revision int6
 	batch, compact, err = RowsToEvents(rows, !keysOnly, false)
 	if err != nil {
 		return batch, err
+	}
+	if settled && batch.CurrentRev != 0 {
+		batch.CurrentRev = currentRev
 	}
 
 	if batch.CurrentRev == 0 {
@@ -431,7 +480,10 @@ func (s *SQLLog) ListStream(ctx context.Context, key, end string, limit, revisio
 		return errorResult(err)
 	}
 
-	if revision == 0 {
+	settled := revision == 0 && key != "" && s.polledRev.Load() != 0
+	if settled {
+		rows, err = s.d.List(ctx, key, end, limit, currentRev, includeDeleted, keysOnly)
+	} else if revision == 0 {
 		rows, err = s.d.ListCurrent(ctx, key, end, limit, includeDeleted, keysOnly)
 	} else {
 		rows, err = s.d.List(ctx, key, end, limit, revision, includeDeleted, keysOnly)
@@ -448,6 +500,10 @@ func (s *SQLLog) ListStream(ctx context.Context, key, end string, limit, revisio
 			return errorResult(err)
 		}
 		kvc <- event.KV
+	}
+
+	if settled && current != 0 {
+		current = currentRev
 	}
 
 	if current == 0 {
@@ -554,6 +610,8 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 	wait := time.NewTicker(time.Second)
 	defer wait.Stop()
 	defer close(result)
+
+	s.polledRev.Store(pollStart)
 
 	for {
 		if waitForMore {
@@ -665,6 +723,7 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 		if saveLast {
 			s.currentRev.CompareAndSwap(pollRevision, rev)
 			pollRevision = rev
+			s.polledRev.Store(rev)
 			if len(sequential) > 0 {
 				result <- server.EventBatch{CurrentRev: pollRevision, Events: sequential}
 			}
